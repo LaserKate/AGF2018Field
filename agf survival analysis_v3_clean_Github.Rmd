@@ -1,0 +1,1307 @@
+---
+title: "AGF juvenile analysis"
+author: "Blake"
+date: "12/06/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Inputs: 
+framecassetterod.csv
+tilepositionrod_MMupdate.csv
+AGF2018_SurvivalReformat.csv
+MAster_AGF2018.csv
+familyregionbreedfactors.csv
+mappingFunctions.RData
+Great_Barrier_Reef_Features.shp # note available upon request from KQ:  https://www.gbrmpa.gov.au/about-us/resources-and-publications/spatial-data-information-services
+R_long_NESP4 table_KQ.csv # note available upon request from KQ
+
+Outputs:
+Fig1_Maptest5.eps
+AGF_Fig2_survival.tiff
+AGF_Fig3_crosslabel.pdf
+AGF_Fig4_growthextrapolate.eps
+AGF_Fig5_colour.tiff
+AGF_Fig6_tradeoffs.tiff
+AGF_colorscores.pdf
+
+# Setup
+## Load packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyr)
+library(tidyverse)
+library(lubridate)
+library(cowplot)
+library(dplyr)
+library(survival)
+library(survminer)
+library(GLMMadaptive)
+library(lme4)
+library(lmerTest)
+library(DHARMa)
+library(car)
+library(emmeans)
+library(lattice)
+library(ggeffects)
+library(here)
+```
+
+```{r}
+# function to fix label decimals
+fmt<-function(x){format(x,nsmall = 1,scientific = FALSE)}
+```
+
+
+## Load data
+```{r cars}
+# rod position in frames
+AGFframe = read.csv(here("Results", "Results 200330", "framecassetterod.csv"), header=T) 
+# recruit position on tile, rods
+AGFrod = read.csv(here("Results", "Results 200330", "tilepositionrod_MMupdate.csv"), header=T)
+# survival in KM format
+AGFsurv = read.csv(here("Results", "Results 200330", "AGF2018_SurvivalReformat.csv"), header=T)
+# color and area responses
+AGF = read.csv(here("Results", "Results 200330", "Master_AGF2018.csv"), header=T) 
+# grouping factors for families
+AGFfactors = read.csv(here("Tile positions data", "familyregionbreedfactors.csv"), header=T) 
+```
+
+## Modify datasets
+```{r}
+# avoid ambiguous 'position' variables
+names(AGFrod)[1] = "Rodposition"
+# PC can't import field names properly. thankfully not working on pc anymore
+names(AGF)[names(AGF) %in% "ï..Date"] = "Date"
+names(AGFfactors)[names(AGFfactors) %in% "ï..Family"] = "Family"
+# create numeric date variable
+AGFsurv$Date_day = NA
+AGFsurv$Date_day[AGFsurv$DeadorCensus=="March"]=0
+AGFsurv$Date_day[AGFsurv$DeadorCensus=="June"]=91
+AGFsurv$Date_day[AGFsurv$DeadorCensus=="October"]=217
+# pc can't import date field
+names(AGFsurv)[names(AGFsurv) %in% "ï..Date"] = "Date"
+
+# this an important fix as Tile numbers are not unique
+AGFsurv$FamTile = interaction(AGFsurv$Family, AGFsurv$Tile, drop=TRUE)
+AGF$FamTile = interaction(AGF$Family, AGF$Tile, drop=TRUE)
+
+```
+
+Join datasets
+Join AGF with grouping factors
+```{r}
+# fix date factor
+#AGF$Date = AGF$ï..Date
+AGF$Date[AGF$Date=="OCtober"]="October" # correct typo
+AGF$Date = as.factor(AGF$Date)
+AGF$Date = droplevels(AGF$Date)
+# reorder date factor levels
+AGF$Date_relevel = factor(AGF$Date, levels=levels(AGF$Date)[c(2,1,3)])
+
+# fix date levels names
+AGF$Date_day=NA
+AGF$Date_day[AGF$Date=="March"]=0
+AGF$Date_day[AGF$Date=="June"]=91
+AGF$Date_day[AGF$Date=="October"]=217
+
+# Need to remove 'D' in survival data
+# Uses original AGF dataset rather than one used for KM
+# Create new survival variable with only two categories
+AGF$SurvivalnoD = AGF$Survival
+AGF$SurvivalnoD[AGF$Survival == "D"] = 1
+AGF$SurvivalnoD = as.numeric(as.character(AGF$SurvivalnoD))
+
+# create unique tile number
+AGF$FamTile = interaction(AGF$Family, AGF$Tile)
+
+```
+
+
+Join data, rod, frame
+```{r}
+# Join area/color to rod info
+AGFr = left_join(AGF, AGFrod, by=c('Family', "Tile.Number"="Tile"))
+AGFr$Rod = as.factor(AGFr$Rod)
+
+# Join data:rod with frames
+AGFframe$Rodfact = as.factor(AGFframe$Rod)
+AGFrf = left_join(AGFr, AGFframe, by=c('Rod'='Rodfact'))
+AGFrff = left_join(AGFrf, AGFfactors)
+AGFrff = droplevels(AGFrff)
+# create factors
+AGFrff$Cassettefact = as.factor(AGFrff$Cassette)
+AGFrff$Tile.Numberfact = as.factor(AGFrff$Tile.Number)
+AGFrff$Framefact = as.factor(AGFrff$Frame)
+AGFrff$Rodfact = as.factor(AGFrff$Rod)
+```
+
+# Growth
+## Modify data
+```{r}
+# remove recruits without area msmt or only one area msmt
+AGF_area = AGFrff %>%
+  arrange(Family, Recruit) %>%
+  group_by(Recruit) %>% 
+  filter(!is.na(Area)) %>% 
+  filter(n()>1) %>% 
+  mutate(Area.rel = (Area-first(Area))/first(Area))
+# calculate relative change in area
+AGFrff %>%
+  arrange(Family, Recruit) %>%
+  group_by(Recruit) %>% 
+  filter(!is.na(Area)) %>% 
+  filter(n()>1) %>% 
+  mutate(Area.rel = (Area-first(Area))/first(Area)) %>% 
+  droplevels()
+# create additional factors for mom, dad
+AGF_area$Egg = substr(AGF_area$Family, start = 1, stop = 2)
+AGF_area$Sperm = substr(AGF_area$Family, start = 4, stop = 5)
+
+
+# identify growth outlier
+filter(AGF_area, Area.rel>8)
+# remove outlier to create AGF_area2
+AGF_area$Date.day = AGF_area$Date.x
+# area2 remove initial areas
+AGF_area2 = filter(AGF_area, Area.rel<8,
+                   Date.day!="March")
+AGF_areaX = filter(AGF_area, Area.rel<8
+                   )
+
+# num recruits?
+length(levels(droplevels(as.factor(AGF_area2$Recruit))))
+# num tiles?
+length(levels(droplevels(as.factor(AGF_area2$FamTile))))
+# missing family?
+length(levels(droplevels(as.factor(AGF$Family))))
+levels(as.factor(AGF$Family))[!levels(as.factor(AGF$Family)) %in% levels(as.factor(AGF_area$Family))]
+```
+
+## Calculate growth rate
+```{r}
+# calculate growth rate using linear regression. filtered to remove juveniles in clumps
+AGF_area_slopes = coef(lme4::lmList(Area ~ Date_day | Recruit, data=filter(AGF_areaX, Single.Clump=="S")))
+# fix recruit names in reg output
+AGF_area_slopes$Recruit = as.factor(row.names(AGF_area_slopes))
+# join slopes with data and fix names
+AGF_area_join = left_join(AGF_area_slopes, AGF_area2, by="Recruit")
+AGF_area_join = rename(AGF_area_join, mm2_day = Date_day.x)
+AGF_area_join = rename(AGF_area_join, Intercept = "(Intercept)")
+# note: AGF_area_join has full df of areas while AGF_area_join_final has growth rates
+AGF_area_join_final = AGF_area_join %>% ungroup() %>% group_by(Recruit) %>% dplyr::slice(1) %>% droplevels()
+
+#AGF_area_join = rename(AGF_area_join, Date = ï..Date)
+glimpse(AGF_area_join)
+# check for loss of samples
+dim(AGF_area_slopes)
+dim(AGF_area_join)
+dim(AGF_area_join_final)
+# num recruits
+length(levels(as.factor(AGF_area_join_final$Recruit)))
+length(levels(as.factor(AGF_area_join_final$FamTile)))
+```
+
+Quick plot growth rate
+```{r}
+# quick plots of growth rate
+qplot(Framefact, mm2_day, data=AGF_area_join_final) #frame
+qplot(Cassettefact, mm2_day, data=AGF_area_join_final) #cassette
+qplot(Rodfact, mm2_day, data=AGF_area_join_final) #rod
+qplot(Family, mm2_day, data=AGF_area_join_final) #family
+qplot(Region, mm2_day, data=AGF_area_join_final) #region
+
+# plot by region
+ggplot(AGF_area2, aes(x=Date_relevel, y=Area, group=Recruit, color=Region))+
+  geom_hline(yintercept = 0, colour="black")+
+  geom_smooth(method='lm')+
+  geom_point()+
+  labs(x="",y="Area (mm^2)")+
+  facet_wrap(~Region)
+
+ggplot(AGF_area2, aes(x=Date_relevel, y=Area, group=Recruit, color=Region, shape=Breed))+
+  geom_hline(yintercept = 0, colour="black")+
+  geom_smooth(method='lm')+
+  geom_point()+
+  labs(x="",y="Area (mm^2)")+
+  facet_wrap(~Region)
+```
+
+## Growth model LMM
+Growth.m0 is final model. Model worked and permitted using the most data since some samples (10) lacked frame information.
+```{r}
+# model with more random effects has singular fit with any more random effects
+Growth.m0 = lmer(mm2_day ~ Region + (1|FamTile), AGF_area_join_final)
+summary(Growth.m0)
+hist(resid(Growth.m0))
+plot(Growth.m0)
+qqnorm(resid(Growth.m0))
+qqline(resid(Growth.m0))
+anova(Growth.m0)
+# calculate means
+emmeans(Growth.m0, ~Region)
+
+# # other models
+# # log transformation doesn't improve residual plots or results
+# Growth.m0log = lmer(log(mm2_day+1) ~ Family + (1|Cassettefact/Rodfact/FamTile), AGF_area_join_final)
+# hist(resid(Growth.m0log))
+# plot(Growth.m0log)
+# qqnorm(resid(Growth.m0log))
+# qqline(resid(Growth.m0log))
+# anova(Growth.m0log)
+
+# Growth.m02 = lmer(mm2_day ~ Family + (1|FamTile), AGF_area_join_final)
+# anova(Growth.m02)
+
+# # very little variation among rods. removed and same result 
+# Growth.m1 = lmer(mm2_day ~ Family + (1|Cassettefact/FamTile), AGF_area_join_final)
+# hist(resid(Growth.m0))
+# plot(Growth.m0)
+# qqnorm(resid(Growth.m0))
+# qqline(resid(Growth.m0))
+# anova(Growth.m0)
+```
+
+Growth rate summaries
+Growth rates
+```{r}
+# how many recruits were used in growth analysis?
+dim(filter(AGF_area_join_final, !is.na(mm2_day)))
+# what are means of each family?
+AGF_area_join_summary = AGF_area_join_final %>% group_by(Family, Egg, Sperm, Region, Breed) %>% 
+  filter(!is.na(mm2_day)) %>% 
+  summarise(
+  Count = n(),
+  Mean_mm2.day = mean(mm2_day, na.rm=T), 
+  SD_mm2.day = sd(mm2_day, na.rm = T)
+  ) %>% 
+  mutate(SE_mm2.day = SD_mm2.day/sqrt(Count), 
+)
+# what are means at each timepoint?
+AGF_area_join_final %>% group_by(Date_relevel) %>% 
+  filter(!is.na(mm2_day)) %>% 
+  summarise(
+  Count = n(),
+  Mean_mm2.day = mean(mm2_day, na.rm=T), 
+  SD_mm2.day = sd(mm2_day, na.rm = T),
+  Mean_mm2 = mean(Area),
+  SE_mm2 = sd(Area)/sqrt(n())
+  ) %>% 
+  mutate(SE_mm2.day = SD_mm2.day/sqrt(Count), 
+)
+# overall mean growth rate of juveniles?
+AGF_area_join_final %>% 
+  ungroup() %>% 
+  filter(!is.na(mm2_day)) %>% 
+  summarise(
+  Count = n(),
+  Mean_mm2.day = mean(mm2_day, na.rm=T), 
+  SD_mm2.day = sd(mm2_day, na.rm = T),
+  
+  ) %>% 
+  mutate(SE_mm2.day = SD_mm2.day/sqrt(Count), 
+)
+# overall mean growth rate using family means?
+AGF_area_join_summary %>% 
+  ungroup() %>% 
+  filter(!is.na(Mean_mm2.day)) %>% 
+  summarise(
+  Count2 = n(),
+  Mean_mm2.day2 = mean(Mean_mm2.day, na.rm=T), 
+  SD_mm2.day2 = sd(Mean_mm2.day, na.rm = T),
+  ) %>% 
+  mutate(SE_mm2.day = SD_mm2.day2/sqrt(Count2))
+# summary by region using family means
+Region_growth_summary = AGF_area_join_summary %>% group_by(Region) %>% 
+  filter(!is.na(Mean_mm2.day)) %>% 
+  summarise(
+  Count = n(),
+  Mean_mm2.day2 = mean(Mean_mm2.day, na.rm=T), 
+  SD_mm2.day2 = sd(Mean_mm2.day, na.rm = T)
+  ) %>% 
+  mutate(SE_mm2.day2 = SD_mm2.day2/sqrt(Count), 
+         
+)
+
+
+```
+
+Recruit size summaries
+```{r}
+# how big are starting recruits in ea family?
+AGF_area_join %>% group_by(Family, Region, Date.x) %>% 
+  filter(!is.na(Area), Area<8, Date.x=="March") %>% 
+  summarise(
+    Count = n(),
+    Area_mm2 = mean(Area, na.rm=T), 
+    SD_mm2 = sd(Area, na.rm = T)
+    ) %>%
+  mutate(SE_mm2 = SD_mm2/sqrt(Count)
+         ) %>% 
+  arrange(desc(Date.x), desc(Area_mm2)) %>% as.data.frame()
+# how big are final recruits in ea family?
+AGF_area_join %>% group_by(Family, Region, Date.x) %>% 
+  filter(!is.na(Area), Area<8, Date.x=="October") %>% 
+  summarise(
+    Count = n(),
+    Area_mm2 = mean(Area, na.rm=T), 
+    SD_mm2 = sd(Area, na.rm = T)
+    ) %>%
+  mutate(SE_mm2 = SD_mm2/sqrt(Count)
+         ) %>% 
+  arrange(desc(Date.x), desc(Area_mm2)) %>% as.data.frame()
+# size by date of all juveniles (not based on family mean)
+AGF_area_join %>% group_by(Date.x) %>% 
+  filter(!is.na(Area), Area<8) %>% 
+  summarise(
+  Count = n(),
+  Area_mm2 = mean(Area, na.rm=T), 
+  SD_mm2 = sd(Area, na.rm = T)
+  ) %>% 
+  mutate(SE_mm2 = SD_mm2/sqrt(Count)
+)
+```
+
+## Extrapolate exponential growth
+```{r}
+AGF_area_growthsumm = AGF_area %>% group_by(Family, Date.x, Region, Date_day) %>% 
+  summarise(Area_mean = mean(Area, na.rm=TRUE),
+            Area_sd = sd(Area, na.rm=T),
+            Count = n()) %>% 
+  mutate(Regionf = ifelse(Region=="Central", 0, 
+                          ifelse(Region=="Hybrid-C", 1, 
+                          ifelse(Region=="Hybrid-N", 2, 3)))
+         )
+
+AGF_area_growthsumm$Family = as.factor(AGF_area_growthsumm$Family)
+AGF_area_growthsumm = AGF_area_growthsumm %>% group_by(Family) %>% 
+  mutate(Area0 = Area_mean[Date_day==0]) %>% 
+  ungroup()
+
+library(nlme)
+AGF_area_growthsumm = droplevels(AGF_area_growthsumm)
+Expfit = nlsList(model = Area_mean ~ Area0 * (1+relR)^Date_day | Family,
+        data=AGF_area_growthsumm,
+        start = list(relR=0.100), na.action = na.pass)
+Expfit_summary = summary(Expfit)
+Expfit_summary = Expfit_summary$coefficients %>% as.data.frame()
+Expfit_summary$Family = row.names(Expfit_summary)
+
+AGF_area_growthsumm_join = left_join(AGF_area_growthsumm, Expfit_summary)
+
+# assume 20 cm diameter at reproduction
+AGF_area_growthsumm_join$Daystorepro = log(100^2*pi/AGF_area_growthsumm_join$Area0)/log(1+AGF_area_growthsumm_join$Estimate.relR)
+AGF_area_growthsumm_join$Yearstorepro = AGF_area_growthsumm_join$Daystorepro/365
+
+# assume 11 cm diameter (abrego) at reproduction
+AGF_area_growthsumm_join$Daystorepro.Abrego = log((11/2*10)^2*pi/AGF_area_growthsumm_join$Area0)/log(1+AGF_area_growthsumm_join$Estimate.relR)
+AGF_area_growthsumm_join$Yearstorepro.Abrego = AGF_area_growthsumm_join$Daystorepro/365
+
+AGF_area_growthsumm_join$Family = as.factor(AGF_area_growthsumm_join$Family)
+
+AGF_area_growthsumm_join %>% group_by(Family) %>% sample_n(1) %>% group_by(Region) %>% summarise(Count = n(),
+               Mean = mean(Daystorepro, na.rm=T)/365, 
+               Median = median(Daystorepro)/365,
+               Sd = sd(Daystorepro, na.rm=T)/365,
+               Mean.Abrego = mean(Daystorepro.Abrego, na.rm=T)/365, 
+               Median.Abrego = median(Daystorepro.Abrego)/365,
+               Sd.Abrego = sd(Daystorepro.Abrego, na.rm=T)/365)
+# plot days to repro for each region
+ggplot(AGF_area_growthsumm_join, aes(x=Family, y=Daystorepro))+geom_point()+facet_grid(.~Region, scales = "free_x")
+
+AGF_area_growthsumm_join %>% group_by(Family) %>% sample_n(1) %>%  ungroup() %>%  summarise(Count = n(),
+               Mean = mean(Daystorepro/365, na.rm=T), 
+               Median = median(Daystorepro/365),
+               SE = sd(Daystorepro/365, na.rm=T)/sqrt(n())) %>% as.data.frame()
+
+# negative growth removed
+AGF_area_growthsumm_join %>% group_by(Family) %>% sample_n(1) %>%  ungroup() %>%
+  filter(Estimate.relR>0) %>% 
+  summarise(Count = n(),
+               Mean = mean(Daystorepro/365, na.rm=T), 
+               Median = median(Daystorepro/365),
+               SE = sd(Daystorepro/365, na.rm=T)/sqrt(n())) %>% as.data.frame()
+# negative growth removed
+AGF_area_growthsumm_join %>% group_by(Family) %>% sample_n(1) %>% group_by(Region) %>% 
+  filter(Estimate.relR>0) %>% 
+  summarise(Count = n(),
+               Mean = mean(Daystorepro, na.rm=T)/365, 
+               Median = median(Daystorepro)/365,
+               Sd = sd(Daystorepro, na.rm=T)/365,
+               Mean.Abrego = mean(Daystorepro.Abrego, na.rm=T)/365, 
+               Median.Abrego = median(Daystorepro.Abrego)/365,
+               Sd.Abrego = sd(Daystorepro.Abrego, na.rm=T)/365)
+```
+
+Join predictions to observed
+```{r}
+pframe <- expand.grid(Family=levels(as.factor(AGF_area_growthsumm_join$Family)),
+                      Date_day= seq(0,217,1))
+pframe = left_join(pframe, select(filter(AGF_area_growthsumm_join, Date_day==0), c(Family, Area0)), by="Family")
+#pframe = left_join(pframe, select(Expfit_summary, c(Family, Estimate.relR)), by="Family") %>% rename(relR = Estimate.relR) %>% mutate(Family = as.factor(Family))
+
+
+
+
+Predicteddata = cbind(arrange(pframe, Family),
+                      Predicted = predict(Expfit,re.form=NA,newdata=arrange(pframe, Family)) )
+
+```
+
+Quick plot obs and pred by family
+```{r}
+ggplot()+
+  geom_pointrange(data=AGF_area_growthsumm_join,
+             aes(x=Date_day, y=Area_mean, ymin=Area_mean-Area_sd, ymax=Area_mean+Area_sd))+
+  facet_wrap(~Family)+
+  geom_line(data=filter(Predicteddata, Date_day<max(AGF_area_growthsumm_join$Date_day)), aes(x=Date_day, y=Predicted), color='red')
+```
+
+Calculate maggie growth rate
+```{r}
+Maggie = data.frame(
+  Date_day = c(0, 31,71,89,127,154,276,340),
+  Area_mm2 = c(1.243333,3.695535,7.953709,3.313677,43.68976,58.20226,173.9635,634.9812)
+)
+
+Maggie.m1 = nls(Area_mm2 ~ Area_mm2[1] * (1+relR)^Date_day,
+        data=Maggie,
+        start = list(relR=0.100), na.action = na.pass)
+summary(Maggie.m1)
+
+Maggiepredicted = data.frame(
+  Date_day=seq(min(Maggie$Date_day), max(Maggie$Date_day), 1),
+  Predictedmm2=predict(
+    Maggie.m1, data.frame(Date_day=seq(min(Maggie$Date_day),
+                                       max(Maggie$Date_day), 1)))
+)
+
+ggplot() + 
+  geom_point(data=Maggie, aes(x=Date_day, y=Area_mm2)) +
+  geom_line(data=Maggiepredicted, aes(x=Date_day, y=Predictedmm2), color='blue')
+
+# time to repro for radius 100 mm
+# calculate maggie time to repro at estimated relR
+log((100^2*pi)/Maggie$Area_mm2[1])/log(1+as.numeric(coef(Maggie.m1)))/365
+# calculate maggie time to repro at relR+SE
+log((100^2*pi)/Maggie$Area_mm2[1])/log(1+coef(Maggie.m1)+summary(Maggie.m1)$coef[2])/365
+# calculate maggie time to repro at relR-SE
+log((100^2*pi)/Maggie$Area_mm2[1])/log(1-coef(Maggie.m1)-summary(Maggie.m1)$coef[2])/365
+
+
+# time to repro for radius 55 mm
+# calculate maggie time to repro at estimated relR
+log((55^2*pi)/Maggie$Area_mm2[1])/log(1+as.numeric(coef(Maggie.m1)))/365
+# calculate maggie time to repro at relR+SE
+log((55^2*pi)/Maggie$Area_mm2[1])/log(1+coef(Maggie.m1)+summary(Maggie.m1)$coef[2])/365
+# calculate maggie time to repro at relR-SE
+log((55^2*pi)/Maggie$Area_mm2[1])/log(1-coef(Maggie.m1)-summary(Maggie.m1)$coef[2])/365
+```
+
+
+
+
+# Color analysis
+## Modify data
+Modify AGF data set for analysis of color. Remove recruits without color score or in clump. Create factor variable of color scores, 'Colorfact'.
+```{r}
+AGF_color = AGFrff %>%
+  arrange(Family, Recruit) %>%
+  filter(!is.na(Color), Color>0, Single.Clump=="S") %>% 
+  mutate(Colorfact = factor(Color)) %>% 
+  droplevels()
+# recruit count
+length(levels(as.factor(AGF_color$Recruit)))
+# tile count
+length(levels(AGF_color$FamTile))
+# count n by cross
+AGF_color %>% 
+  group_by(Family) %>% 
+  filter(Date_relevel=="October") %>% 
+  summarise(Count = n())
+```
+
+
+```{r}
+# # median summary for plotting later
+Mediansummary = AGF_color %>% group_by(Region, Date_day) %>% summarise(MedianColor=median(Color))
+
+```
+
+
+## Multinomial model color
+model
+```{r}
+library(nnet)
+Color.mn1 = multinom(Colorfact ~ Region*Date_relevel, data=AGF_color, threshold='equidistant')
+# Color.mn1f = multinom(Colorfact ~ Region*Date_relevel, data=AGF_color, threshold='equidistant')
+Color.mn2 = multinom(Colorfact ~ Region+Date_relevel, data=AGF_color, threshold='equidistant')
+Color.mn3 = multinom(Colorfact ~ Date_relevel, data=AGF_color, threshold='equidistant')
+Color.mn3r = multinom(Colorfact ~ Region, data=AGF_color, threshold='equidistant')
+Color.mn4 = multinom(Colorfact ~ 1, data=AGF_color, threshold='equidistant')
+
+anova(Color.mn1, Color.mn2, Color.mn3, Color.mn3r, Color.mn4)
+anova(Color.mn2, Color.mn3r)
+anova(Color.mn1, Color.mn2) #interaction not needed
+Anova(Color.mn1, type='III') # only date significant
+
+summary(Color.mn1)
+```
+
+
+
+posthoc Multinomial
+```{r}
+# use model with only date
+emmeans(Color.mn1, pairwise~Date_relevel|Colorfact)
+```
+
+predictions Multinomial
+```{r}
+Color.multipred = data.frame(ggpredict(Color.mn1, terms = c("Region", "Date_relevel"), type = "re"))
+names(Color.multipred)[c(1,3,4)]=c('Region', 'Color', 'Date_relevel')
+#data.frame(ggpredict(Color.clm1, terms = c("Region", "Date_relevel"), type = "fe"))
+
+ggplot(Color.multipred, aes(x=Color, y=predicted))+
+  #geom_vline(data=Mediansummary, aes(xintercept=MedianColor), color='gray40', lty='dashed')+
+  geom_hline(yintercept =0)+
+  facet_grid(Date_relevel~Region)+
+  geom_bar(fill='gray20', bins = 6, aes(y=predicted), stat='identity')+
+  scale_y_continuous(breaks=seq(0,0.6,0.1))+
+  theme_pubr()
+```
+
+family Multinomial model
+```{r}
+Color.mn1scale = multinom(Colorfact ~ Family*Date_day, data=AGF_color, threshold='equidistant')
+Anova(Color.mn1scale)
+
+emmeans(Color.mn1scale, pairwise~Date_day|Colorfact)
+emmeans(Color.mn1scale, pairwise~Colorfact|Date_day)
+```
+
+
+
+
+# Survival of recruits
+## KaplanM curves
+Modify, join survival with other factors
+```{r}
+# create date factors
+AGFsurv$Date_day = NA
+AGFsurv$Date_day[AGFsurv$DeadorCensus=="March"]=0
+AGFsurv$Date_day[AGFsurv$DeadorCensus=="June"]=91
+AGFsurv$Date_day[AGFsurv$DeadorCensus=="October"]=217
+
+AGFsurv$Egg = substr(AGFsurv$Family, start = 1, stop = 2)
+AGFsurv$Sperm = substr(AGFsurv$Family, start = 4, stop = 5)
+
+# join
+AGFsurvr = left_join(AGFsurv, AGFrod, by=c("Tile.Number"="Tile", 'Family'))
+AGFsurvr$Rod = as.factor(AGFsurvr$Rod)
+
+AGFsurvr.single = left_join(filter(AGFsurvr, Single.Clump=="S"), AGFframe, by=c('Rod'='Rodfact'))
+#names(AGFsurvposit)[17] = "Tileposition"
+AGFsurvr.single2 = left_join(AGFsurvr.single, AGFfactors) %>% droplevels()
+
+# count FamTiles
+length(levels(AGFsurvr.single2$FamTile))
+# count Recruit
+length(levels(as.factor(AGFsurvr.single2$Recruit)))
+# count of final surviving
+AGFsurvr.single2 %>% 
+  filter(Date_day==217, Event==FALSE) %>% 
+  group_by(Family) %>% 
+  summarise(Count = n())
+FinalSurv = AGFsurvr.single2 %>% 
+  filter(Date_day==91) %>% 
+  group_by(Family) %>% 
+  summarise(Count = n())
+
+# count of initial surviving
+AGFsurvr.single2 %>% 
+  filter(Date_day==91) %>% 
+  group_by(Family, DeadorCensus) %>% 
+  summarise(Count = n())
+```
+
+
+## Kaplan Meir curves by Region/Family/Cross type
+```{r}
+glimpse(AGFsurvr.single)
+#with(AGFsurv, Surv(Date_day, Event))
+# survival curves
+Testcurves = AGFsurvr.single2 %>% 
+  surv_fit(Surv(Date_day, Event) ~ Region + cluster(Family), data=., confint=TRUE)
+# curves to get family estimates
+Famcurves= AGFsurvr.single2 %>% surv_fit(Surv(Date_day, Event) ~ Region + Family, data=., confint=TRUE)
+
+# pairwise_survdiff(Testcurves, rho=0)
+
+ggsurvplot(Testcurves,
+           ggtheme = theme_bw(),
+           conf.int=TRUE, 
+           risk.table = F,
+           pval=TRUE,
+           #conf.int.style = "step",
+           #risk.table = "pct",
+           risk.table.y.text.col = TRUE,
+           risk.table.y.text = FALSE,
+           risk.table.col = 'Region',
+           #surv.median.line = 'hv',
+           palette = c("black", "gray60", 'firebrick1', 'firebrick3'),
+           break.time.by = 70,
+           xlim = c(0,217))
+
+summary(Testcurves)
+# ggsave('AGF_surv.pdf', last_plot(), dpi=300, width=11, height=8.5)
+
+survdiff(Surv(Date_day, Event) ~ Region + cluster(Family), data = AGFsurvr.single2, rho = 1)
+
+surv_fit(Surv(Survival2, Status) ~ Region + cluster(Family), data = AGFsurvr.single2, group.by = c(Region)) %>%
+  ggsurvplot(ggtheme = theme_bw(), conf.int=TRUE, risk.table = TRUE, pval=TRUE) %>%
+  purrr::map(function(ggsurv) {ggsurv$plot}) %>%
+  ggpubr::ggarrange(plotlist = .)
+```
+
+posthoc curves by Region and family
+Test for effect of factors on curves. 
+```{r}
+
+pairwise_survdiff(Surv(Date_day, Event) ~ Region, data = AGFsurvr.single2, rho=1)
+
+pairwise_survdiff(Surv(Date_day, Event) ~ Family, data = AGFsurvr.single2, rho=1)
+
+
+```
+
+
+
+
+
+# Make final fgures
+Theme
+```{r}
+theme_AGF = function(){
+  theme_pubr(base_size = 12) %+replace%
+    theme()
+}
+```
+
+## Fig1 Map
+### North arrow function
+```{r scale-bar-function}
+library(maps) 
+ library(maptools)  
+ library(ggplot2)  
+ library(grid)  
+ #Then, we need a function to get the scale bar coordinates:
+
+ #
+ # Result #
+ #--------#
+ # Return a list whose elements are :
+ #   - rectangle : a data.frame containing the coordinates to draw the first rectangle ;
+ #   - rectangle2 : a data.frame containing the coordinates to draw the second rectangle ;
+ #   - legend : a data.frame containing the coordinates of the legend texts, and the texts as well.
+ #
+ # Arguments : #
+ #-------------#
+ # lon, lat : longitude and latitude of the bottom left point of the first rectangle to draw ;
+ # distanceLon : length of each rectangle ;
+ # distanceLat : width of each rectangle ;
+ # distanceLegend : distance between rectangles and legend texts ;
+ # dist.units : units of distance "km" (kilometers) (default), "nm" (nautical miles), "mi" (statute miles). 
+createScaleBar <-
+ function(lon,lat,distanceLon,distanceLat,distanceLegend, dist.units =
+ "km"){
+     # First rectangle
+     bottomRight <- gcDestination(lon = lon, lat = lat, bearing = 90, dist = distanceLon, dist.units = dist.units, model = "WGS84")
+
+     topLeft <- gcDestination(lon = lon, lat = lat, bearing = 0, dist = distanceLat, dist.units = dist.units, model = "WGS84")
+     rectangle <- cbind(lon=c(lon, lon, bottomRight[1,"long"], bottomRight[1,"long"], lon),
+     lat = c(lat, topLeft[1,"lat"], topLeft[1,"lat"],lat, lat))
+     rectangle <- data.frame(rectangle, stringsAsFactors = FALSE)
+
+     # Second rectangle t right of the first rectangle
+     bottomRight2 <- gcDestination(lon = lon, lat = lat, bearing = 90, dist = distanceLon*2, dist.units = dist.units, model = "WGS84")
+     rectangle2 <- cbind(lon = c(bottomRight[1,"long"], bottomRight[1,"long"], bottomRight2[1,"long"], bottomRight2[1,"long"],
+ bottomRight[1,"long"]),
+     lat=c(lat, topLeft[1,"lat"], topLeft[1,"lat"], lat, lat))
+     rectangle2 <- data.frame(rectangle2, stringsAsFactors = FALSE)
+
+     # Now let's deal with the text
+     onTop <- gcDestination(lon = lon, lat = lat, bearing = 0, dist = distanceLegend, dist.units = dist.units, model = "WGS84")
+     onTop2 <- onTop3 <- onTop
+     onTop2[1,"long"] <- bottomRight[1,"long"]
+     onTop3[1,"long"] <- bottomRight2[1,"long"]
+
+     legend <- rbind(onTop, onTop2, onTop3)
+     legend <- data.frame(cbind(legend, text = c(0, distanceLon, distanceLon*2)), stringsAsFactors = FALSE, row.names = NULL)
+     return(list(rectangle = rectangle, rectangle2 = rectangle2, legend = legend)) } 
+#We also need a function to obtain the coordinates of the North arrow:
+
+ #
+ # Result #
+ #--------#
+ # Returns a list containing :
+ #   - res : coordinates to draw an arrow ;
+ #   - coordinates of the middle of the arrow (where the "N" will be plotted).
+ #
+ # Arguments : #
+ #-------------#
+ # scaleBar : result of createScaleBar() ;
+ # length : desired length of the arrow ;
+ # distance : distance between legend rectangles and the bottom of the arrow ;
+ # dist.units : units of distance "km" (kilometers) (default), "nm" (nautical miles), "mi" (statute miles). 
+createOrientationArrow <-
+ function(scaleBar, length, distance = 1, dist.units = "km"){
+     lon <- scaleBar$rectangle2[1,1]
+     lat <- scaleBar$rectangle2[1,2]
+
+     # Bottom point of the arrow
+     begPoint <- gcDestination(lon = lon, lat = lat, bearing = 0, dist = distance, dist.units = dist.units, model = "WGS84")
+     lon <- begPoint[1,"long"]
+     lat <- begPoint[1,"lat"]
+
+     # Let us create the endpoint
+     onTop <- gcDestination(lon = lon, lat = lat, bearing = 0, dist = length, dist.units = dist.units, model = "WGS84")
+
+     leftArrow <- gcDestination(lon = onTop[1,"long"], lat = onTop[1,"lat"], bearing = 205, dist = length/7, dist.units =
+ dist.units, model = "WGS84")
+
+     rightArrow <- gcDestination(lon = onTop[1,"long"], lat = onTop[1,"lat"], bearing = 155, dist = length/7, dist.units =
+ dist.units, model = "WGS84")
+
+     res <- rbind(
+             cbind(x = lon, y = lat, xend = onTop[1,"long"], yend = onTop[1,"lat"]),
+             cbind(x = leftArrow[1,"long"], y = leftArrow[1,"lat"], xend = onTop[1,"long"], yend = onTop[1,"lat"]),
+             cbind(x = rightArrow[1,"long"], y = rightArrow[1,"lat"], xend = onTop[1,"long"], yend = onTop[1,"lat"]))
+
+     res <- as.data.frame(res, stringsAsFactors = FALSE)
+
+     # Coordinates from which "N" will be plotted
+     coordsN <- cbind(x = lon, y = (lat + onTop[1,"lat"])/2)
+
+     return(list(res = res, coordsN = coordsN)) } 
+
+#The last function enables the user to draw the elements:
+
+ #
+ # Result #
+ #--------#
+ # This function enables to draw a scale bar on a ggplot object, and optionally an orientation arrow #
+ # Arguments : #
+ #-------------#
+ # lon, lat : longitude and latitude of the bottom left point of the first rectangle to draw ;
+ # distanceLon : length of each rectangle ;
+ # distanceLat : width of each rectangle ;
+ # distanceLegend : distance between rectangles and legend texts ;
+ # dist.units : units of distance "km" (kilometers) (by default), "nm" (nautical miles), "mi" (statute miles) ;
+ # rec.fill, rec2.fill : filling colour of the rectangles (default to white, and black, resp.);
+ # rec.colour, rec2.colour : colour of the rectangles (default to black for both);
+ # legend.colour : legend colour (default to black);
+ # legend.size : legend size (default to 3);
+ # orientation : (boolean) if TRUE (default), adds an orientation arrow to the plot ;
+ # arrow.length : length of the arrow (default to 500 km) ;
+ # arrow.distance : distance between the scale bar and the bottom of the arrow (default to 300 km) ;
+ # arrow.North.size : size of the "N" letter (default to 6). 
+scaleBar <- function(lon, lat, distanceLon, distanceLat, distanceLegend,
+ dist.unit = "km", rec.fill = "white", rec.colour = "black", rec2.fill
+ = "black", rec2.colour = "black", legend.colour = "black", legend.size = 4, orientation = TRUE, arrow.length = 70, arrow.distance = 50, arrow.North.size = 6){
+     laScaleBar <- createScaleBar(lon = lon, lat = lat, distanceLon = distanceLon, distanceLat = distanceLat, distanceLegend =
+ distanceLegend, dist.unit = dist.unit)
+     # First rectangle
+     rectangle1 <- geom_polygon(data = laScaleBar$rectangle, aes(x = lon, y = lat), fill = rec.fill, colour = rec.colour)
+
+     # Second rectangle
+     rectangle2 <- geom_polygon(data = laScaleBar$rectangle2, aes(x = lon, y = lat), fill = rec2.fill, colour = rec2.colour)
+
+     # Legend
+     scaleBarLegend <- annotate("text", label = paste(laScaleBar$legend[,"text"], dist.unit, sep=""), x =
+ laScaleBar$legend[,"long"], y = laScaleBar$legend[,"lat"], size =
+ legend.size, colour = legend.colour)
+
+     res <- list(rectangle1, rectangle2, scaleBarLegend)
+
+     if(orientation){# Add an arrow pointing North
+         coordsArrow <- createOrientationArrow(scaleBar = laScaleBar, length = arrow.length, distance = arrow.distance, dist.unit =
+ dist.unit)
+         arrow <- list(geom_segment(data = coordsArrow$res, aes(x = x, y = y, xend = xend, yend = yend)), annotate("text", label = "N", x =
+ coordsArrow$coordsN[1,"x"], y = coordsArrow$coordsN[1,"y"], size =
+ arrow.North.size, colour = "black"))
+         res <- c(res, arrow)
+     }
+     return(res) }
+```
+
+### Load shapefile
+```{r}
+# For mapping functions contact Dr Murray Logan (m.logan@aims.gov.au)
+# load("PATH/mappingFunctions.RData")
+library(ggmap)
+library(broom)
+library(rgeos)
+library(maptools)
+library(ggsn)
+
+# GBR reef shapefile available upon request:
+# https://www.gbrmpa.gov.au/about-us/resources-and-publications/spatial-data-information-services
+
+# gbr.sp<- readShapeSpatial(
+#     "PATH/Great_Barrier_Reef_Features.shp",
+#     proj4string = CRS('+proj=longlat +ellps=WGS84'),
+#     repair=TRUE,force_ring=T,verbose=TRUE)
+
+Sitecoord = read.csv("Data/R_long_NESP4 table_KQ.csv") %>% 
+  group_by(Reef) %>% 
+  slice(1) %>% 
+  filter(Reef %in% c("Curd","Sandbank7","LongSandy","Davies","Backnumbers","MagneticIsGeoffrey")) %>% 
+  mutate(Reefsymbol = ifelse(Reef=="MagneticIsGeoffrey", "Growth rate comparison", "Source site")) %>% 
+  mutate(Reefsymbol = ifelse(Reef=="Davies", "Transplant site", Reefsymbol)) %>% 
+  mutate(Region = ifelse(Reef=="MagneticIsGeoffrey" | Reef=="Davies"| Reef=="Backnumbers" , 1, 0)) %>% 
+  filter(Reef!="MagneticIsGeoffrey")
+
+Sitecoord$Reef[Sitecoord$Reef=="MagneticIsGeoffrey"]="Mag. Island"
+
+
+
+Sitecoord = Sitecoord %>% ungroup() %>%  
+  mutate(Reef = recode_factor(Reef, 
+                              "Curd" = "Curd (CU)",
+                              "Sandbank7" = "Sandbank7 (SB)",
+                              "LongSandy" = "Long Sandy (LS)",
+                              "Davies" = "Davies (DR)",
+                              "Backnumbers" = "Backnumbers (BK)",
+                              #"Mag. Island" = "Mag. Island"
+                              ))
+```
+
+```{r}
+##Use the site locations to generate a bounding box for cropping
+##Expand the bounding box by 1 unit ( + 1)                                        
+bb = as(raster::extent(cbind(Sitecoord$longitude,Sitecoord$latitude))+1, "SpatialPolygons")
+proj4string(bb) <- CRS("+proj=longlat +ellps=WGS84")
+
+gbr.sp.simp = rgeos::gBuffer(gbr.sp, width = 0, byid = TRUE)
+gbr.sp.crop <- raster::intersect(gbr.sp.simp, bb)
+gbr.df <- tidy(gbr.sp.crop, region='FEAT_NAME')
+
+reef = gbr.df %>% filter(id=='Reef')
+land = gbr.df %>% filter(id=='Mainland')
+island = gbr.df %>% filter(id=='Island')
+```
+
+Plot with shapefiles
+```{r}
+map2 = ggplot(Sitecoord, aes(y=latitude,x=longitude))+
+  geom_polygon(data=reef, aes(y=lat,x=long, group=group), fill='lightblue') +
+  geom_polygon(data=land, aes(y=lat,x=long, group=group), fill='gray60', color='gray60') +
+  geom_polygon(data=island, aes(y=lat,x=long, group=group), fill='gray60', color='gray60')+
+  geom_point(aes(shape=as.factor(Reefsymbol), color=as.factor(Region)), size=3)+
+  ggrepel::geom_label_repel(aes(label=Reef, color=as.factor(Region)), size=2)+
+  scale_color_manual(values=c("firebrick4", 'black'), name="") +
+  scale_shape_manual(values=c(20, 18))+
+  coord_map() +
+  theme_classic()+
+  labs(x="Longitude (°)", y="Latitude (°)")+
+  geom_rect(data=Sitecoord, aes(ymin=-Inf, xmin=-Inf, ymax=Inf, xmax=Inf), fill=NA, color='black') +
+  scale_x_continuous(expand=c(0, 0)) +
+  scale_y_continuous(expand=c(0, 0)) + 
+  theme(legend.position="none")
+  
+  
+```
+
+Inset
+```{r}
+library(maps)
+library(mapdata)
+library(sp)
+library(oz)
+
+aus <- map("world","Australia", fill=TRUE, xlim=c(145,151), ylim=c(-24,-16), mar=c(0,0,0,0), plot=FALSE)
+aus.sp = maptools::map2SpatialPolygons(aus, IDs=aus$names, proj4string=CRS("+proj=longlat"))
+
+Inset = ggplot(data=fortify(aus.sp), aes(y=lat, x=long, group=group))+
+  geom_polygon(color='gray60', fill='gray60')+
+  theme_map()+
+  geom_rect(aes(xmin=143, xmax=148, ymin=-19, ymax=-12), color='black', fill=NA, inherit.aes = FALSE)+
+  coord_map()+
+  theme(panel.border = element_rect(fill=NA, color='black', size=1.0))
+  
+Map3 = ggdraw()+
+  draw_plot(map2)+
+  draw_plot(Inset, x=0.605, y=0.6525, height=0.25, width=0.40, hjust = 0, vjust = 0)
+
+# ggsave("Results/Figures_200616/Fig1_Maptest5.eps", plot=Map3, dpi=300, width=85, height=170, units='mm')
+```
+
+
+
+
+## Fig2 Survival
+```{r}
+library(ggrepel)
+# plot step curves
+CurvesmoothbyRegion = data.frame(
+  Region = sub('Region=', '', summary(Testcurves,time=seq(0,217,1))$strata),
+  Time = summary(Testcurves,time=seq(0,217,1))$time,
+  Surv = summary(Testcurves,time=seq(0,217,1))$surv,
+  SE = summary(Testcurves,time=seq(0,217,1))$std.err,
+  LowerCI = summary(Testcurves,time=seq(0,217,1))$lower,
+  UpperCI = summary(Testcurves,time=seq(0,217,1))$upper
+) %>% mutate(Region2 = factor(Region, labels=c('Central','Central-H', 'North-H', 'North')))
+
+Plotregionsteps = ggplot(CurvesmoothbyRegion, aes(Time, Surv, color=Region2, fill=Region2, group=Region2)) +
+  #geom_smooth(position=position_dodge(1))+
+  geom_ribbon(aes(ymin=Surv-SE, ymax=Surv+SE), position = position_dodge(21), alpha=0.3, size=0.3)+
+  geom_line(position=position_dodge(21), size=0.8)+
+  theme_pubr(base_size = 8)+
+  scale_x_continuous(breaks = c(0,91,217))+
+  scale_y_continuous(breaks=seq(0,1,0.2), limits = c(0,1))+
+  scale_color_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="")+
+  scale_fill_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="")+
+  labs(x="Days in field", y="Survival (%)")+
+  theme(legend.key.height = unit(0.3, "cm"),
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(0,0,0,0),
+        plot.margin = margin(rep(0.5,4)))
+
+
+
+#sub(",", "", summary(Famcurves,time=seq(0,217,1))$strata)
+#sapply(strsplit(summary(Famcurves,time=seq(0,217,1))$strata, ","), "[", 2)
+
+# calculate curves by family to have final survival estimate
+CurvesmoothbyFamily = data.frame(
+  Label = summary(Famcurves,time=seq(0,217,1))$strata,
+  Region = str_extract(string = summary(Famcurves,time=seq(0,217,1))$strata, pattern = "(?<=\\=)[^ ]*(?=,)"),
+  Family = str_extract(string = summary(Famcurves,time=seq(0,217,1))$strata, pattern = "(?<=\\y=)[^z]*()"),
+  Time = summary(Famcurves,time=seq(0,217,1))$time,
+  Surv = summary(Famcurves,time=seq(0,217,1))$surv,
+  SE = summary(Famcurves,time=seq(0,217,1))$std.err,
+  LowerCI = summary(Famcurves,time=seq(0,217,1))$lower,
+  UpperCI = summary(Famcurves,time=seq(0,217,1))$upper,
+  nRisk = summary(Famcurves,time=seq(0,217,1))$n.risk-summary(Famcurves, time=seq(0,217,1))$n.event
+) %>% 
+  mutate(Region2 = factor(Region, labels = c('Central', 'Central-H', 'North-H', 'North')))
+
+# get final surv estimate from curves
+Surv217 =  filter(CurvesmoothbyFamily, Time==217) %>% 
+  mutate(Region = as.factor(Region),
+         Family = as.factor(Family),
+         Daviesshape = as.factor(ifelse(Family=='DRxDR', 1, 0)))
+
+# Count of final surviving
+filter(CurvesmoothbyFamily, Time==217) %>% select(Family, nRisk)
+# Count of initial surviving
+FinalSurv = filter(CurvesmoothbyFamily, Time==0) %>% select(Family, nRisk) %>% mutate(Count = nRisk) %>% select(-nRisk)
+
+# join in sample size
+Surv217 = left_join(Surv217, FinalSurv)
+# create label with sample size
+Surv217 = Surv217 %>% 
+  mutate(Newlabel = paste(Family, ' (', Count, ')', sep=""))
+
+# plot final survival panel b
+Plottsurv217 = ggplot(Surv217, aes(x=Region2, y=Surv, color=Region2, group=Family))+
+  geom_hline(yintercept=filter(Surv217, Family=="DRxDR")$Surv, color='gray', lty='dashed')+
+  geom_hline(yintercept=0, color='gray')+
+  geom_pointrange(aes(ymin=Surv-SE, ymax=Surv+SE, color=Region2, shape=Daviesshape), position=position_dodge(width=0.8))+
+  geom_text(aes(label=Newlabel, y=0.9, color=Region2), size=2, angle=90, position=position_dodge(width=0.8), vjust=0.5, hjust=1)+
+  scale_y_continuous(limits=c(0,0.9), breaks=seq(0,0.9,0.2))+
+  scale_color_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="", guide=FALSE)+
+  scale_shape_manual(values=c(20, 18), name="", guide=FALSE)+
+  labs(x='Region', y="Survival after 217 days")+
+  theme(legend.key.height = unit(0.3, "cm"),
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(0,0,0,0),
+        plot.margin = margin(rep(0.5,4)))+
+  theme_pubr(base_size = 8)
+
+# combine panels
+Fig2 = plot_grid(Plotregionsteps, Plottsurv217, labels=c('A','B'), align = 'h', rel_widths = c(1.7,1), axis='b')
+#ggsave("AGF_Fig2_survival.tiff", Fig2, path="Results/Figures_200616", width=180, height=90, units=c('mm'), dpi=300)
+```
+
+
+
+## Fig3 Area and growth
+```{r}
+# Fig3a Trends of area over time
+AGF_area_growthsumm_join = AGF_area_growthsumm_join %>% 
+  mutate(Region2 = factor(as.factor(Region), labels=c('Central', 'Central-H', 'North-H', 'North')),
+         Family2 = fct_reorder(Family, Region, min),
+         Daviesshape = as.factor(ifelse(Family=='DRxDR', 1, 0))
+         )
+
+# panel a. area over time
+Plotareatrend = ggplot(AGF_area_growthsumm_join, aes(x=Date_day, y=Area_mean, color=Region2, fill=Region2, shape=Daviesshape))+
+  geom_hline(aes(yintercept=0))+
+  geom_ribbon(aes(ymin=Area_mean-Area_sd/sqrt(Count), ymax=Area_mean+Area_sd/sqrt(Count), color=Region2, fill=Region2), alpha=0.1)+
+  geom_point(show.legend = FALSE)+
+  geom_line()+
+  facet_wrap(~Family2)+
+  scale_y_continuous(breaks=seq(0,6,2), limits=c(0,6))+
+  scale_x_continuous(breaks=c(0,91,217))+
+  scale_fill_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="", guide=FALSE)+
+  scale_color_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="", guide=FALSE)+
+  scale_shape_manual(values=c(20,18))+
+  labs(x='Days in field', y=expression(paste('Area (mm'^2~')')))+
+  theme_pubr(base_size = 8)
+
+
+# Fig3b mean growth rates by family
+# calc avg growth rate by family means
+Growthfam = AGF_area_join_final %>% group_by(Family, Region) %>%  summarise(Count = n(),
+            Mean = mean(mm2_day, na.rm=T),
+            SE = sd(mm2_day, na.rm=T)/sqrt(n()),
+            Count = n()) %>% 
+  ungroup() %>% 
+  arrange(Mean) %>% 
+  mutate(Family = as.vector(Family)) %>% 
+  mutate(Familyordered = fct_reorder(Family, Mean),
+         Countlabel = paste(Family, ' (', Count, ')', sep=""))
+# modify factors
+Growthfam = Growthfam %>%
+  mutate(Region2 = factor(Region)) %>%
+  mutate(Region2 = fct_recode(Region2, "Central-H" = 'Hybrid-C', "North-H" = 'Hybrid-N')) %>% 
+  mutate(Region2 = factor(Region2, levels=c("Central", "Central-H", "North-H", "North"))) %>% 
+  mutate(Daviesshape = as.factor(ifelse(Family=='DRxDR', 1, 0))) %>% 
+  ungroup() %>% 
+  arrange(Region2, Mean)
+  
+# plot panel 3b growth rate
+Plotgrowthrate = ggplot(filter(Growthfam, !is.na(Region2)), aes(x=Region2, y=Mean, color=Region2, group=Family))+
+  geom_hline(data=filter(Growthfam, Family=="DRxDR"), aes(yintercept=Mean), color='gray', lty='dashed')+
+  geom_hline(yintercept = 0, color='gray')+
+  geom_pointrange(aes(ymin=Mean-SE, ymax=Mean+SE, color=Region2, fill=Region2, shape=Daviesshape), position=position_dodge(0.8))+
+  geom_text(aes(label=Countlabel, y=0.020), angle=90, position=position_dodge(0.8), vjust=0.1, hjust=1, size=2)+
+  #scale_y_continuous(breaks=seq(-0.005, 0.02, 0.005), limits=c(-0.005, 0.02))+
+  scale_fill_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="", guide=FALSE)+
+  scale_color_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="", guide=FALSE)+
+  scale_shape_manual(values=c(20,18), name="", guide=FALSE)+
+  scale_size(range=c(0,1), guide=FALSE)+
+  labs(x='Region', y=expression(paste('Growth rate (mm'^2~'day'^-1~')')))+
+  theme_pubr(base_size = 8)
+
+# make fig 3b
+Fig3 = plot_grid(Plotareatrend, Plotgrowthrate, labels=c('A','B'), align = 'h', rel_widths = c(1.7,1), axis='b' )
+#ggsave("AGF_Fig3_crosslabel.tiff", Fig3, path="Results/Figures_200616", width=180, height=90, units=c('mm'), dpi=300)
+
+
+
+```
+
+
+
+##Fig4 Growth extrapolation
+Comparison of Magentic Island and Davies Reef
+```{r}
+Extrap = data.frame(Day = c(0,31,71,89,127,154,276,340,0,91,217),
+           mm2 = c(1.243333, 3.695535,7.953709, 3.313677, 43.68976, 58.20226, 173.9635, 634.9812,1.49,2.29, 2.94),
+           se = c(0.077247078, 0.381727675, 2.211370018, 1.018964531, 8.554636158, 12.78076308, 64.32948832, 243.9108102, .917/sqrt(3), .496/sqrt(5), 1.45/sqrt(6)),
+           Site = c(rep("Magnetic", 8), rep("Davies", 3))
+)
+
+Plotareatendcomparison = ggplot(Extrap, aes(x=Day, y=mm2, group=Site, lty=Site, shape=Site))+
+  geom_pointrange(aes(ymin=mm2-se, max=mm2+se), lty='solid')+
+  geom_line()+
+  theme_pubr(base_size=8)+
+  scale_y_continuous(breaks=seq(0,900,150), limits=c(0,900))+
+  scale_shape_manual(values=c(18, 20), name="")+
+  scale_linetype_manual(values=c('solid', 'dashed'), name="")+
+  labs(x="Days in field", y=expression(paste('Area (mm'^2~')')))+
+  guides(shape = guide_legend(nrow = 1))+
+  theme_pubr(base_size = 8)+
+  theme(legend.key.width = unit(1, "cm"),
+        legend.position = c(0.5,0.95))
+
+
+```
+
+Histogram of exp growth rates
+```{r}
+
+Expratecurve <- with(AGF_area_growthsumm_join, data.frame(
+  x = seq(min(Estimate.relR), max(Estimate.relR), length.out=100)))
+
+Expratecurve$y= with(Expratecurve,
+                     dnorm(100, mean = mean(AGF_area_growthsumm_join$Estimate.relR), sd=sd(AGF_area_growthsumm_join$Estimate.relR)))
+
+
+Plotexpratehist = ggplot(filter(AGF_area_growthsumm_join, Date_day==217), aes(x=Estimate.relR))+
+  #geom_density(aes(y=..scaled..))+
+  geom_histogram(aes(), binwidth = 0.001, fill='black', color='black')+
+  #geom_density(data=Expratecurve, aes(x=y), color='red', size=1.25)+
+stat_function(fun = function(x) dnorm(x,
+                                      mean = mean(filter(AGF_area_growthsumm_join, Date_day==217)$Estimate.relR),
+                                      sd = sd(filter(AGF_area_growthsumm_join, Date_day==217)$Estimate.relR)) * 16 * 0.001, color='red', size=1.25)+
+  labs(x="Relative rate of exp. growth", y="Count")+
+  #scale_y_continuous(breaks=seq(0,1.0,0.2))+
+  scale_x_continuous(breaks=c(0.0000, .0025, 0.0050), labels = fmt)+
+  theme_pubr(base_size = 8)
+```
+
+Plot time until reproductive size
+```{r}
+AGF_area_growthsumm = AGF_areaX %>% group_by(Family, Date.x, Region, Date_day) %>% 
+  summarise(Area_mean = mean(Area, na.rm=TRUE),
+            Area_sd = sd(Area, na.rm=T),
+            Count = n()) %>% 
+  mutate(Regionf = ifelse(Region=="Central", 0, 
+                          ifelse(Region=="Hybrid-C", 1, 
+                          ifelse(Region=="Hybrid-N", 2, 3)))
+         )
+
+AGF_area_growthsumm$Family = as.factor(AGF_area_growthsumm$Family)
+AGF_area_growthsumm = AGF_area_growthsumm %>% group_by(Family) %>% 
+  mutate(Area0 = Area_mean[Date_day==0]) %>% 
+  ungroup()
+
+AGF_area_growthsumm = droplevels(AGF_area_growthsumm)
+```
+
+
+```{r}
+Plotexpratefam = ggplot(filter(AGF_area_growthsumm_join, Date_day==217), aes(x=Region, y=Daystorepro/365, group=Family))+
+  geom_hline(yintercept=0)+
+  geom_hline(yintercept = log((100^2*pi)/Maggie$Area_mm2[1])/log(1+as.numeric(coef(Maggie.m1)))/365, lty='solid', color='gray')+
+  geom_hline(yintercept=filter(AGF_area_growthsumm_join, Date_day==217, Family=="DRxDR")$Daystorepro/365, lty='dashed', color='gray')+
+  geom_point(aes(color=Region, shape=Daviesshape), position=position_jitter(width=0.15, height=0.0, seed=1), show.legend = TRUE, size=3)+
+  ggrepel::geom_text_repel(aes(label=Family, color=Region), size=1.5, point.padding = 0.25, position = position_jitter(width = 0.15, seed=1, height=0))+
+  scale_y_continuous(breaks=c(-40, -30, -20, -10, 0, 10, 20, 30))+
+  scale_color_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="", guide=FALSE)+
+    labs(x='Region', y='Years until reproductive size')+
+  scale_shape_manual(values=c(20,18), name="", guide=FALSE)+
+  theme_pubr(base_size = 8)
+
+
+```
+
+Combine plots
+```{r}
+Toprow = plot_grid(Plotareatendcomparison, Plotexpratehist, nrow=1, axis='bt', align='h', labels=c("A","B"), label_x=0)
+Fig4 = plot_grid(Toprow, Plotexpratefam, ncol=1, align='v', axis='r', labels=c("","C"))
+
+# ggsave('AGF_Fig4_growthextrapolate.eps', Fig4, path="Results/Figures_200616", width = 180, height = 140, units = 'mm', dpi=300)
+```
+
+## Fig5. Colour scores
+Observed proportions (multinomial)
+```{r}
+# make df
+AGF_color = AGF_color %>% mutate(
+  Region2 = factor(Region, labels=c('Central', 'Central-H', 'North-H', 'North')))
+Mediansummary$Date_dayf = as.factor(Mediansummary$Date_day)
+Mediansummary$Region2 = factor(Mediansummary$Region, labels=c('Central', 'Central-H', 'North-H', 'North'))
+AGF_color$Date_dayf = as.factor(AGF_color$Date_day)
+
+# plot color histograms
+Plotcolordist = ggplot(AGF_color, aes(x=Color))+
+  geom_vline(data=Mediansummary, aes(xintercept=MedianColor), color='gray40', lty='dashed')+
+  geom_hline(yintercept =0)+
+  facet_grid(Date_dayf~Region2)+
+  geom_bar(aes(y=..prop.., fill=factor(..x..)), bins = 6, color='black')+
+  scale_y_continuous(breaks=seq(0,0.6,0.2))+
+  scale_fill_manual(values = c("#F7EBE1", "#F7DCC2", "#F0BF8A", "#D39558", "#9C5F26", "#773E1A"))+
+  labs(x="Colour score", y="Proportion of surviving juveniles")+
+  theme_pubr(base_size = 8)+
+  theme(legend.position = "none")
+```
+
+Mean color scores
+```{r}
+# try summarising to Family level
+AGF_color_famsumm = AGF_color %>% group_by(Family, Date_relevel, Date_day, Region, Breed) %>% 
+  summarise(Color.mean = mean(Color),
+            Color.se = sd(Color)/sqrt(n()),
+            Color.n = n()) %>% 
+  as.data.frame()
+# modify factors
+AGF_color_famsumm$Region2 = factor(AGF_color_famsumm$Region, labels=c('Central', 'Central-H', 'North-H', 'North'))
+AGF_color_famsumm$Dummyfacet = 1
+
+
+# create davies overlay for all regions
+Daviescoloroverlay = rbind(filter(AGF_color_famsumm, Family=="DRxDR"),
+                           filter(AGF_color_famsumm, Family=="DRxDR"),
+                           filter(AGF_color_famsumm, Family=="DRxDR"),
+                           filter(AGF_color_famsumm, Family=="DRxDR")
+                           ) %>% 
+  mutate(Region2 = as.factor(c(rep("Central", 3), rep("Central-H", 3), rep("North-H", 3), rep("North", 3))))
+
+# plot panel b color mean over time
+Plotmeancolor = ggplot(AGF_color_famsumm, aes(x=Date_day, y=Color.mean, group=Family, color=Color.mean))+
+  geom_pointrange(aes(ymin=Color.mean-Color.se,
+                      ymax=Color.mean+Color.se),
+                  position=position_dodge(width = 28))+
+  geom_line(position=position_dodge(width = 28))+
+  geom_point(data=Daviescoloroverlay, color='black', size=4, shape=18)+
+    geom_line(data=Daviescoloroverlay, color='black', size=.7)+
+  scale_x_continuous(breaks=c(0,91,217))+
+  scale_y_continuous(limits=c(1,6), breaks=seq(1.0,6.0,1.0), labels =fmt)+
+  scale_color_stepsn(colors = c("#F7EBE1", "#F7DCC2", "#F0BF8A", "#D39558", "#9C5F26", "#773E1A"))+
+  facet_grid(Dummyfacet~Region2)+
+  labs(x='Days in field', y='Colour score')+
+  theme_pubr(base_size = 8)+
+  theme(legend.position = "none")+
+  theme(legend.key.height = unit(0.3, "cm"),
+        legend.margin=margin(0,0,0,0),
+        legend.box.margin=margin(0,0,0,0),
+        plot.margin = margin(rep(0.5,4)),
+        strip.background.y = element_rect(color='white', fill='white'),
+        strip.text.y = element_text(color='white'))
+
+# plot fig 5
+Fig5 = plot_grid(Plotcolordist, Plotmeancolor, labels=c('A','B'), ncol=1, align='v')
+#ggsave("AGF_Fig5_colour.tiff", Fig5, path="Results/Figures_200616", width=180, height=160, units=c('mm'), dpi=300)
+```
+
+## Fig6 Trade-offs
+```{r}
+# create df
+Tradeoffs = left_join(Growthfam, filter(CurvesmoothbyFamily, Time==217), by=c("Family", "Region", "Region2"))
+
+# plot fig6 scatterplot
+Plottradeoffs = ggplot(Tradeoffs, aes(x=Surv, y=Mean))+
+  geom_hline(yintercept = 0)+
+  geom_hline(data=filter(Tradeoffs, Family=='DRxDR'), aes(yintercept=Mean), lty='dashed', color='gray')+
+  geom_vline(data=filter(Tradeoffs, Family=='DRxDR'), aes(xintercept=Surv), lty='dashed', color='gray')+
+  geom_errorbar(aes(ymin=Mean-SE.x, ymax=Mean+SE.x, color=Region2), size=0.3 )+
+  geom_errorbarh(aes(xmin=Surv-SE.y, xmax=Surv+SE.y, color=Region2), size=0.3)+
+  geom_point(aes(color=Region2, shape=Daviesshape))+
+  ggrepel::geom_text_repel(aes(label=Family, color=Region2), size=1)+
+  scale_y_continuous(limits=c(-0.005,0.015), breaks=seq(-.005, .0025*7, .0025))+
+  scale_x_continuous(limits=c(0,0.75), breaks=c(seq(0,0.75,0.15)))+
+  scale_color_manual(values=c('black', 'gray50', 'goldenrod2', 'firebrick4'), name="")+
+  scale_shape_manual(values=c(20,18), name="", guide=FALSE)+
+    labs(y = expression(paste('Growth rate (mm'^2~'day'^-1~')')),
+       x = "Survival (%)"
+  )+
+  theme_pubr(base_size=8)
+
+Plottradeoffs
+
+#ggsave("AGF_Fig6_tradeoffs.tiff", Plottradeoffs, path="Results/Figures_200616", width=85, height=85, units=c('mm'), dpi=300)
+```
+
+
+
+## Color square tiles Coral health chart
+```{r}
+  Cscores = c("#F7EBE1", "#F7DCC2", "#F0BF8A", "#D39558", "#9C5F26", "#773E1A")
+
+Plotcolorscores = ggplot(data=NULL)+
+  geom_tile(aes(x=rep(1,6), y=1:6, fill=Cscores))+
+  scale_fill_manual(values=rev(c("#F7EBE1", "#F7DCC2", "#F0BF8A", "#D39558", "#9C5F26", "#773E1A")))+
+  #scale_y_continuous(limits=c(0,1))+
+  scale_x_continuous(breaks=1:6)+
+  theme_nothing()+
+  theme(plot.margin = margin(rep(0.1,4)))
+
+# ggsave('AGF_colorscores.pdf', Plotcolorscores, path='Results/Results200507/', width=25.4, height=25.4*6, units='mm', dpi=300)
+```
+
